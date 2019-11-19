@@ -33,6 +33,7 @@ import tensorflow as tf
 # pylint: enable=g-bad-import-order
 
 from official.r1.utils import export
+from official.r1.utils import tpu as tpu_util
 from official.transformer import compute_bleu
 from official.transformer import translate
 from official.transformer.model import model_params
@@ -41,7 +42,6 @@ from official.transformer.utils import dataset
 from official.transformer.utils import metrics
 from official.transformer.utils import schedule
 from official.transformer.utils import tokenizer
-from official.utils.accelerator import tpu as tpu_util
 from official.utils.flags import core as flags_core
 from official.utils.logs import hooks_helper
 from official.utils.logs import logger
@@ -140,7 +140,7 @@ def model_fn(features, labels, mode, params):
 
 def record_scalars(metric_dict):
   for key, value in metric_dict.items():
-    tf.contrib.summary.scalar(name=key, tensor=value)
+    tf.summary.scalar(name=key, tensor=value)
 
 
 def get_learning_rate(learning_rate, hidden_size, learning_rate_warmup_steps):

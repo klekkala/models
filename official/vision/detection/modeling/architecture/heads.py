@@ -25,7 +25,7 @@ import numpy as np
 import tensorflow.compat.v2 as tf
 from tensorflow.python.keras import backend
 from official.vision.detection.modeling.architecture import nn_ops
-from official.vision.detection.utils import spatial_transform
+from official.vision.detection.ops import spatial_transform_ops
 
 
 class RpnHead(object):
@@ -177,18 +177,18 @@ class MaskrcnnHead(object):
 
   def __init__(self,
                num_classes,
-               mrcnn_resolution,
+               mask_target_size,
                batch_norm_relu=nn_ops.BatchNormRelu):
     """Initialize params to build Fast R-CNN head.
 
     Args:
       num_classes: a integer for the number of classes.
-      mrcnn_resolution: a integer that is the resolution of masks.
+      mask_target_size: a integer that is the resolution of masks.
       batch_norm_relu: an operation that includes a batch normalization layer
         followed by a relu layer(optional).
     """
     self._num_classes = num_classes
-    self._mrcnn_resolution = mrcnn_resolution
+    self._mask_target_size = mask_target_size
     self._batch_norm_relu = batch_norm_relu
 
   def __call__(self, roi_features, class_indices, is_training=None):
@@ -272,7 +272,7 @@ class MaskrcnnHead(object):
             name='mask_fcn_logits')(
                 net)
         mask_outputs = tf.reshape(mask_outputs, [
-            -1, num_rois, self._mrcnn_resolution, self._mrcnn_resolution,
+            -1, num_rois, self._mask_target_size, self._mask_target_size,
             self._num_classes
         ])
 
@@ -302,6 +302,7 @@ class RetinanetHead(object):
                anchors_per_location,
                num_convs=4,
                num_filters=256,
+               use_separable_conv=False,
                batch_norm_relu=nn_ops.BatchNormRelu):
     """Initialize params to build RetinaNet head.
 
@@ -313,6 +314,8 @@ class RetinanetHead(object):
       num_convs: `int` number of stacked convolution before the last prediction
         layer.
       num_filters: `int` number of filters used in the head architecture.
+      use_separable_conv: `bool` to indicate whether to use separable
+        convoluation.
       batch_norm_relu: an operation that includes a batch normalization layer
         followed by a relu layer(optional).
     """
@@ -324,6 +327,7 @@ class RetinanetHead(object):
 
     self._num_convs = num_convs
     self._num_filters = num_filters
+    self._use_separable_conv = use_separable_conv
 
     with tf.name_scope('class_net') as scope_name:
       self._class_name_scope = tf.name_scope(scope_name)
@@ -340,52 +344,88 @@ class RetinanetHead(object):
 
   def _build_class_net_layers(self, batch_norm_relu):
     """Build re-usable layers for class prediction network."""
-    self._class_predict = tf.keras.layers.Conv2D(
-        self._num_classes * self._anchors_per_location,
-        kernel_size=(3, 3),
-        bias_initializer=tf.constant_initializer(-np.log((1 - 0.01) / 0.01)),
-        kernel_initializer=tf.keras.initializers.RandomNormal(stddev=1e-5),
-        padding='same',
-        name='class-predict')
+    if self._use_separable_conv:
+      self._class_predict = tf.keras.layers.SeparableConv2D(
+          self._num_classes * self._anchors_per_location,
+          kernel_size=(3, 3),
+          bias_initializer=tf.constant_initializer(-np.log((1 - 0.01) / 0.01)),
+          padding='same',
+          name='class-predict')
+    else:
+      self._class_predict = tf.keras.layers.Conv2D(
+          self._num_classes * self._anchors_per_location,
+          kernel_size=(3, 3),
+          bias_initializer=tf.constant_initializer(-np.log((1 - 0.01) / 0.01)),
+          kernel_initializer=tf.keras.initializers.RandomNormal(stddev=1e-5),
+          padding='same',
+          name='class-predict')
     self._class_conv = []
     self._class_batch_norm_relu = {}
     for i in range(self._num_convs):
-      self._class_conv.append(
-          tf.keras.layers.Conv2D(
-              self._num_filters,
-              kernel_size=(3, 3),
-              bias_initializer=tf.zeros_initializer(),
-              kernel_initializer=tf.keras.initializers.RandomNormal(
-                  stddev=0.01),
-              activation=None,
-              padding='same',
-              name='class-' + str(i)))
+      if self._use_separable_conv:
+        self._class_conv.append(
+            tf.keras.layers.SeparableConv2D(
+                self._num_filters,
+                kernel_size=(3, 3),
+                bias_initializer=tf.zeros_initializer(),
+                activation=None,
+                padding='same',
+                name='class-' + str(i)))
+      else:
+        self._class_conv.append(
+            tf.keras.layers.Conv2D(
+                self._num_filters,
+                kernel_size=(3, 3),
+                bias_initializer=tf.zeros_initializer(),
+                kernel_initializer=tf.keras.initializers.RandomNormal(
+                    stddev=0.01),
+                activation=None,
+                padding='same',
+                name='class-' + str(i)))
       for level in range(self._min_level, self._max_level + 1):
         name = self._class_net_batch_norm_name(i, level)
         self._class_batch_norm_relu[name] = batch_norm_relu(name=name)
 
   def _build_box_net_layers(self, batch_norm_relu):
     """Build re-usable layers for box prediction network."""
-    self._box_predict = tf.keras.layers.Conv2D(
-        4 * self._anchors_per_location,
-        kernel_size=(3, 3),
-        bias_initializer=tf.zeros_initializer(),
-        kernel_initializer=tf.keras.initializers.RandomNormal(stddev=1e-5),
-        padding='same',
-        name='box-predict')
+    if self._use_separable_conv:
+      self._box_predict = tf.keras.layers.SeparableConv2D(
+          4 * self._anchors_per_location,
+          kernel_size=(3, 3),
+          bias_initializer=tf.zeros_initializer(),
+          padding='same',
+          name='box-predict')
+    else:
+      self._box_predict = tf.keras.layers.Conv2D(
+          4 * self._anchors_per_location,
+          kernel_size=(3, 3),
+          bias_initializer=tf.zeros_initializer(),
+          kernel_initializer=tf.keras.initializers.RandomNormal(stddev=1e-5),
+          padding='same',
+          name='box-predict')
     self._box_conv = []
     self._box_batch_norm_relu = {}
     for i in range(self._num_convs):
-      self._box_conv.append(
-          tf.keras.layers.Conv2D(
-              self._num_filters,
-              kernel_size=(3, 3),
-              activation=None,
-              bias_initializer=tf.zeros_initializer(),
-              kernel_initializer=tf.keras.initializers.RandomNormal(
-                  stddev=0.01),
-              padding='same',
-              name='box-' + str(i)))
+      if self._use_separable_conv:
+        self._box_conv.append(
+            tf.keras.layers.SeparableConv2D(
+                self._num_filters,
+                kernel_size=(3, 3),
+                activation=None,
+                bias_initializer=tf.zeros_initializer(),
+                padding='same',
+                name='box-' + str(i)))
+      else:
+        self._box_conv.append(
+            tf.keras.layers.Conv2D(
+                self._num_filters,
+                kernel_size=(3, 3),
+                activation=None,
+                bias_initializer=tf.zeros_initializer(),
+                kernel_initializer=tf.keras.initializers.RandomNormal(
+                    stddev=0.01),
+                padding='same',
+                name='box-' + str(i)))
       for level in range(self._min_level, self._max_level + 1):
         name = self._box_net_batch_norm_name(i, level)
         self._box_batch_norm_relu[name] = batch_norm_relu(name=name)
@@ -508,7 +548,9 @@ class ShapemaskPriorHead(object):
       if self._shape_prior_path:
         if self._use_category_for_mask:
           fid = tf.io.gfile.GFile(self._shape_prior_path, 'rb')
-          class_tups = pickle.load(fid)
+          # The encoding='bytes' options is for incompatibility between python2
+          # and python3 pickle.
+          class_tups = pickle.load(fid, encoding='bytes')
           max_class_id = class_tups[-1][0] + 1
           class_masks = np.zeros((max_class_id, self._num_clusters,
                                   self._mask_crop_size, self._mask_crop_size),
@@ -542,7 +584,7 @@ class ShapemaskPriorHead(object):
       level_outer_boxes = outer_boxes / tf.pow(
           2., tf.expand_dims(detection_prior_levels, -1))
       detection_prior_levels = tf.cast(detection_prior_levels, tf.int32)
-      uniform_priors = spatial_transform.crop_mask_in_target_box(
+      uniform_priors = spatial_transform_ops.crop_mask_in_target_box(
           tf.ones([
               batch_size, self._num_of_instances, self._mask_crop_size,
               self._mask_crop_size
@@ -550,7 +592,7 @@ class ShapemaskPriorHead(object):
 
       # Prepare crop features.
       multi_level_features = self._get_multilevel_features(fpn_features)
-      crop_features = spatial_transform.single_level_feature_crop(
+      crop_features = spatial_transform_ops.single_level_feature_crop(
           multi_level_features, level_outer_boxes, detection_prior_levels,
           self._min_mask_level, self._mask_crop_size)
 
@@ -562,7 +604,7 @@ class ShapemaskPriorHead(object):
           batch_size, self._num_of_instances, self._mask_crop_size,
           self._mask_crop_size
       ])
-      predicted_detection_priors = spatial_transform.crop_mask_in_target_box(
+      predicted_detection_priors = spatial_transform_ops.crop_mask_in_target_box(
           fused_shape_priors, boxes, outer_boxes, self._mask_crop_size)
       predicted_detection_priors = tf.reshape(
           predicted_detection_priors,
