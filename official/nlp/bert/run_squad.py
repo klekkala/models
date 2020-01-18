@@ -34,8 +34,12 @@ from official.nlp import optimization
 from official.nlp.bert import common_flags
 from official.nlp.bert import input_pipeline
 from official.nlp.bert import model_saving_utils
-from official.nlp.bert import squad_lib
+# word-piece tokenizer based squad_lib
+from official.nlp.bert import squad_lib as squad_lib_wp
+# sentence-piece tokenizer based squad_lib
+from official.nlp.bert import squad_lib_sp
 from official.nlp.bert import tokenization
+from official.utils.misc import distribution_utils
 from official.utils.misc import keras_utils
 from official.utils.misc import tpu_lib
 
@@ -65,6 +69,10 @@ flags.DEFINE_bool(
     'do_lower_case', True,
     'Whether to lower case the input text. Should be True for uncased '
     'models and False for cased models.')
+flags.DEFINE_float(
+    'null_score_diff_threshold', 0.0,
+    'If null_score - best_non_null is greater than the threshold, '
+    'predict null. This is only used for SQuAD v2.')
 flags.DEFINE_bool(
     'verbose_logging', False,
     'If true, all of the warnings related to data processing will be printed. '
@@ -79,14 +87,21 @@ flags.DEFINE_integer(
     'max_answer_length', 30,
     'The maximum length of an answer that can be generated. This is needed '
     'because the start and end predictions are not conditioned on one another.')
-flags.DEFINE_bool(
-    'use_keras_bert_for_squad', False, 'Whether to use keras BERT for squad '
-    'task. Note that when the FLAG "hub_module_url" is specified, '
-    '"use_keras_bert_for_squad" cannot be True.')
+flags.DEFINE_string(
+    'sp_model_file', None,
+    'The path to the sentence piece model. Used by sentence piece tokenizer '
+    'employed by ALBERT.')
+
 
 common_flags.define_common_bert_flags()
 
 FLAGS = flags.FLAGS
+
+MODEL_CLASSES = {
+    'bert': (modeling.BertConfig, squad_lib_wp, tokenization.FullTokenizer),
+    'albert': (modeling.AlbertConfig, squad_lib_sp,
+               tokenization.FullSentencePieceTokenizer),
+}
 
 
 def squad_loss_fn(start_positions,
@@ -124,6 +139,7 @@ def get_loss_fn(loss_factor=1.0):
 
 def get_raw_results(predictions):
   """Converts multi-replica predictions to RawResult."""
+  squad_lib = MODEL_CLASSES[FLAGS.model_type][1]
   for unique_ids, start_logits, end_logits in zip(predictions['unique_ids'],
                                                   predictions['start_logits'],
                                                   predictions['end_logits']):
@@ -170,10 +186,7 @@ def predict_squad_customized(strategy, input_meta_data, bert_config,
     # Prediction always uses float32, even if training uses mixed precision.
     tf.keras.mixed_precision.experimental.set_policy('float32')
     squad_model, _ = bert_models.squad_model(
-        bert_config,
-        input_meta_data['max_seq_length'],
-        float_type=tf.float32,
-        use_keras_bert=FLAGS.use_keras_bert_for_squad)
+        bert_config, input_meta_data['max_seq_length'], float_type=tf.float32)
 
   checkpoint_path = tf.train.latest_checkpoint(FLAGS.model_dir)
   logging.info('Restoring checkpoints from %s', checkpoint_path)
@@ -223,7 +236,8 @@ def train_squad(strategy,
   if use_float16:
     tf.keras.mixed_precision.experimental.set_policy('mixed_float16')
 
-  bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+  bert_config = MODEL_CLASSES[FLAGS.model_type][0].from_json_file(
+      FLAGS.bert_config_file)
   epochs = FLAGS.num_train_epochs
   num_train_examples = input_meta_data['train_data_size']
   max_seq_length = input_meta_data['max_seq_length']
@@ -241,9 +255,7 @@ def train_squad(strategy,
         bert_config,
         max_seq_length,
         float_type=tf.float16 if use_float16 else tf.float32,
-        hub_module_url=FLAGS.hub_module_url,
-        use_keras_bert=False
-        if FLAGS.hub_module_url else FLAGS.use_keras_bert_for_squad)
+        hub_module_url=FLAGS.hub_module_url)
     squad_model.optimizer = optimization.create_optimizer(
         FLAGS.learning_rate, steps_per_epoch * epochs, warmup_steps)
     if use_float16:
@@ -287,7 +299,14 @@ def train_squad(strategy,
 
 def predict_squad(strategy, input_meta_data):
   """Makes predictions for a squad dataset."""
-  bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+  config_cls, squad_lib, tokenizer_cls = MODEL_CLASSES[FLAGS.model_type]
+  bert_config = config_cls.from_json_file(FLAGS.bert_config_file)
+  if tokenizer_cls == tokenization.FullTokenizer:
+    tokenizer = tokenizer_cls(
+        vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
+  else:
+    assert tokenizer_cls == tokenization.FullSentencePieceTokenizer
+    tokenizer = tokenizer_cls(sp_model_file=FLAGS.sp_model_file)
   doc_stride = input_meta_data['doc_stride']
   max_query_length = input_meta_data['max_query_length']
   # Whether data should be in Ver 2.0 format.
@@ -297,9 +316,6 @@ def predict_squad(strategy, input_meta_data):
       input_file=FLAGS.predict_file,
       is_training=False,
       version_2_with_negative=version_2_with_negative)
-
-  tokenizer = tokenization.FullTokenizer(
-      vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
 
   eval_writer = squad_lib.FeatureWriter(
       filename=os.path.join(FLAGS.model_dir, 'eval.tf_record'),
@@ -315,7 +331,7 @@ def predict_squad(strategy, input_meta_data):
   # of examples must be a multiple of the batch size, or else examples
   # will get dropped. So we pad with fake examples which are ignored
   # later on.
-  dataset_size = squad_lib.convert_examples_to_features(
+  kwargs = dict(
       examples=eval_examples,
       tokenizer=tokenizer,
       max_seq_length=input_meta_data['max_seq_length'],
@@ -324,6 +340,11 @@ def predict_squad(strategy, input_meta_data):
       is_training=False,
       output_fn=_append_feature,
       batch_size=FLAGS.predict_batch_size)
+
+  # squad_lib_sp requires one more argument 'do_lower_case'.
+  if squad_lib == squad_lib_sp:
+    kwargs['do_lower_case'] = FLAGS.do_lower_case
+  dataset_size = squad_lib.convert_examples_to_features(**kwargs)
   eval_writer.close()
 
   logging.info('***** Running predictions *****')
@@ -349,6 +370,8 @@ def predict_squad(strategy, input_meta_data):
       output_prediction_file,
       output_nbest_file,
       output_null_log_odds_file,
+      version_2_with_negative=version_2_with_negative,
+      null_score_diff_threshold=FLAGS.null_score_diff_threshold,
       verbose=FLAGS.verbose_logging)
 
 
@@ -364,13 +387,10 @@ def export_squad(model_export_path, input_meta_data):
   """
   if not model_export_path:
     raise ValueError('Export path is not specified: %s' % model_export_path)
-  bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
-
+  bert_config = MODEL_CLASSES[FLAGS.model_type][0].from_json_file(
+      FLAGS.bert_config_file)
   squad_model, _ = bert_models.squad_model(
-      bert_config,
-      input_meta_data['max_seq_length'],
-      float_type=tf.float32,
-      use_keras_bert=FLAGS.use_keras_bert_for_squad)
+      bert_config, input_meta_data['max_seq_length'], float_type=tf.float32)
   model_saving_utils.export_bert_model(
       model_export_path, model=squad_model, checkpoint_dir=FLAGS.model_dir)
 
@@ -386,17 +406,10 @@ def main(_):
     export_squad(FLAGS.model_export_path, input_meta_data)
     return
 
-  strategy = None
-  if FLAGS.strategy_type == 'mirror':
-    strategy = tf.distribute.MirroredStrategy()
-  elif FLAGS.strategy_type == 'multi_worker_mirror':
-    strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
-  elif FLAGS.strategy_type == 'tpu':
-    cluster_resolver = tpu_lib.tpu_initialize(FLAGS.tpu)
-    strategy = tf.distribute.experimental.TPUStrategy(cluster_resolver)
-  else:
-    raise ValueError('The distribution strategy type is not supported: %s' %
-                     FLAGS.strategy_type)
+  strategy = distribution_utils.get_distribution_strategy(
+      distribution_strategy=FLAGS.distribution_strategy,
+      num_gpus=FLAGS.num_gpus,
+      tpu_address=FLAGS.tpu)
   if FLAGS.mode in ('train', 'train_and_predict'):
     train_squad(strategy, input_meta_data)
   if FLAGS.mode in ('predict', 'train_and_predict'):

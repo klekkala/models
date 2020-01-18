@@ -24,6 +24,7 @@ import math
 import six
 import tensorflow as tf
 
+from tensorflow.python.util import deprecation
 from official.modeling import tf_utils
 
 
@@ -107,6 +108,45 @@ class BertConfig(object):
     return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
 
 
+class AlbertConfig(BertConfig):
+  """Configuration for `ALBERT`."""
+
+  def __init__(self,
+               embedding_size,
+               num_hidden_groups=1,
+               inner_group_num=1,
+               **kwargs):
+    """Constructs AlbertConfig.
+
+    Args:
+      embedding_size: Size of the factorized word embeddings.
+      num_hidden_groups: Number of group for the hidden layers, parameters in
+        the same group are shared. Note that this value and also the following
+        'inner_group_num' has to be 1 for now, because all released ALBERT
+        models set them to 1. We may support arbitary valid values in future.
+      inner_group_num: Number of inner repetition of attention and ffn.
+      **kwargs: The remaining arguments are the same as above 'BertConfig'.
+    """
+    super(AlbertConfig, self).__init__(**kwargs)
+    self.embedding_size = embedding_size
+
+    # TODO(chendouble): 'inner_group_num' and 'num_hidden_groups' are always 1
+    # in the released ALBERT. Support other values in AlbertTransformerEncoder
+    # if needed.
+    if inner_group_num != 1 or num_hidden_groups != 1:
+      raise ValueError("We only support 'inner_group_num' and "
+                       "'num_hidden_groups' as 1.")
+
+  @classmethod
+  def from_dict(cls, json_object):
+    """Constructs a `AlbertConfig` from a Python dictionary of parameters."""
+    config = AlbertConfig(embedding_size=None, vocab_size=None)
+    for (key, value) in six.iteritems(json_object):
+      config.__dict__[key] = value
+    return config
+
+
+@deprecation.deprecated(None, "The function should not be used any more.")
 def get_bert_model(input_word_ids,
                    input_mask,
                    input_type_ids,
@@ -145,6 +185,8 @@ class BertModel(tf.keras.layers.Layer):
   ```
   """
 
+  @deprecation.deprecated(
+      None, "Please use `nlp.modeling.networks.TransformerEncoder` instead.")
   def __init__(self, config, float_type=tf.float32, **kwargs):
     super(BertModel, self).__init__(**kwargs)
     self.config = (
@@ -202,6 +244,7 @@ class BertModel(tf.keras.layers.Layer):
     Args:
       inputs: packed input tensors.
       mode: string, `bert` or `encoder`.
+
     Returns:
       Output tensor of the last layer for BERT training (mode=`bert`) which
       is a float Tensor of shape [batch_size, seq_length, hidden_size] or
@@ -320,8 +363,8 @@ class EmbeddingPostprocessor(tf.keras.layers.Layer):
 
     self.output_layer_norm = tf.keras.layers.LayerNormalization(
         name="layer_norm", axis=-1, epsilon=1e-12, dtype=tf.float32)
-    self.output_dropout = tf.keras.layers.Dropout(rate=self.dropout_prob,
-                                                  dtype=tf.float32)
+    self.output_dropout = tf.keras.layers.Dropout(
+        rate=self.dropout_prob, dtype=tf.float32)
     super(EmbeddingPostprocessor, self).build(input_shapes)
 
   def __call__(self, word_embeddings, token_type_ids=None, **kwargs):
@@ -508,8 +551,8 @@ class Dense3D(tf.keras.layers.Layer):
     use_bias: A bool, whether the layer uses a bias.
     output_projection: A bool, whether the Dense3D layer is used for output
       linear projection.
-    backward_compatible: A bool, whether the variables shape are compatible
-      with checkpoints converted from TF 1.x.
+    backward_compatible: A bool, whether the variables shape are compatible with
+      checkpoints converted from TF 1.x.
   """
 
   def __init__(self,
@@ -609,8 +652,9 @@ class Dense3D(tf.keras.layers.Layer):
     """
     if self.backward_compatible:
       kernel = tf.keras.backend.reshape(self.kernel, self.kernel_shape)
-      bias = (tf.keras.backend.reshape(self.bias, self.bias_shape)
-              if self.use_bias else None)
+      bias = (
+          tf.keras.backend.reshape(self.bias, self.bias_shape)
+          if self.use_bias else None)
     else:
       kernel = self.kernel
       bias = self.bias
@@ -746,7 +790,9 @@ class TransformerBlock(tf.keras.layers.Layer):
         rate=self.hidden_dropout_prob)
     self.attention_layer_norm = (
         tf.keras.layers.LayerNormalization(
-            name="self_attention_layer_norm", axis=-1, epsilon=1e-12,
+            name="self_attention_layer_norm",
+            axis=-1,
+            epsilon=1e-12,
             # We do layer norm in float32 for numeric stability.
             dtype=tf.float32))
     self.intermediate_dense = Dense2DProjection(
@@ -871,6 +917,7 @@ class Transformer(tf.keras.layers.Layer):
       inputs: packed inputs.
       return_all_layers: bool, whether to return outputs of all layers inside
         encoders.
+
     Returns:
       Output tensor of the last layer or a list of output tensors.
     """

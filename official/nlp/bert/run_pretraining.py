@@ -30,6 +30,7 @@ from official.nlp import optimization
 from official.nlp.bert import common_flags
 from official.nlp.bert import input_pipeline
 from official.nlp.bert import model_saving_utils
+from official.utils.misc import distribution_utils
 from official.utils.misc import tpu_lib
 
 flags.DEFINE_string('input_files', None,
@@ -58,12 +59,10 @@ def get_pretrain_dataset_fn(input_file_pattern, seq_length,
   """Returns input dataset from input file string."""
   def _dataset_fn(ctx=None):
     """Returns tf.data.Dataset for distributed BERT pretraining."""
-    input_files = []
-    for input_pattern in input_file_pattern.split(','):
-      input_files.extend(tf.io.gfile.glob(input_pattern))
+    input_patterns = input_file_pattern.split(',')
     batch_size = ctx.get_per_replica_batch_size(global_batch_size)
     train_dataset = input_pipeline.create_pretrain_dataset(
-        input_files,
+        input_patterns,
         seq_length,
         max_predictions_per_seq,
         batch_size,
@@ -127,16 +126,9 @@ def run_customized_training(strategy,
       train_input_fn=train_input_fn,
       steps_per_epoch=steps_per_epoch,
       steps_per_loop=steps_per_loop,
-      epochs=epochs)
+      epochs=epochs,
+      sub_model_export_name='pretrained/bert_model')
 
-  # Creates the BERT core model outside distribution strategy scope.
-  _, core_model = bert_models.pretrain_model(bert_config, max_seq_length,
-                                             max_predictions_per_seq)
-
-  # Restores the core model from model checkpoints and get a new checkpoint only
-  # contains the core model.
-  model_saving_utils.export_pretraining_checkpoint(
-      checkpoint_dir=model_dir, model=core_model)
   return trained_model
 
 
@@ -172,15 +164,10 @@ def main(_):
 
   if not FLAGS.model_dir:
     FLAGS.model_dir = '/tmp/bert20/'
-  strategy = None
-  if FLAGS.strategy_type == 'mirror':
-    strategy = tf.distribute.MirroredStrategy()
-  elif FLAGS.strategy_type == 'tpu':
-    cluster_resolver = tpu_lib.tpu_initialize(FLAGS.tpu)
-    strategy = tf.distribute.experimental.TPUStrategy(cluster_resolver)
-  else:
-    raise ValueError('The distribution strategy type is not supported: %s' %
-                     FLAGS.strategy_type)
+  strategy = distribution_utils.get_distribution_strategy(
+      distribution_strategy=FLAGS.distribution_strategy,
+      num_gpus=FLAGS.num_gpus,
+      tpu_address=FLAGS.tpu)
   if strategy:
     print('***** Number of cores used : ', strategy.num_replicas_in_sync)
 
